@@ -208,3 +208,10 @@ Wait for consent; never auto-create ADRs. Group related decisions (stacks, authe
 
 ## Code Standards
 See `.specify/memory/constitution.md` for code quality, testing, performance, security, and architecture principles.
+
+## Active Technologies
+- Node.js (latest LTS), React (latest stable) + Docusaurus 3.x, MDX, Algolia DocSearch, Prism, Mermaid (001-ai-robotics-textbook)
+- N/A (static site) (001-ai-robotics-textbook)
+
+## Recent Changes
+- 001-ai-robotics-textbook: Added Node.js (latest LTS), React (latest stable) + Docusaurus 3.x, MDX, Algolia DocSearch, Prism, Mermaid
