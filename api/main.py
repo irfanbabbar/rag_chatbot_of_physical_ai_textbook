@@ -93,20 +93,16 @@
 # @app.get("/")
 # async def root():
 #     return {"message": "RAG Chatbot FastAPI is running!"}
-
+# backend/main.py
 import os
 import shutil
-import ssl  # Added for SSL fix
+import ssl
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List
-
-# --- SSL Fix ---
-# This bypasses certificate verification for local environments
-ssl._create_default_https_context = ssl._create_unverified_context
 
 # --- LangChain & AI Imports ---
 from langchain_groq import ChatGroq 
@@ -116,37 +112,35 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Import your custom Qdrant settings
-from vector_db import get_qdrant_client, COLLECTION_NAME
+# Use the dot (.) for relative import
+from .vector_db import get_qdrant_client, COLLECTION_NAME
 
 # Load environment variables
 load_dotenv()
 
+# --- SSL Fix ---
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# --- FastAPI Setup ---
+app = FastAPI(title="Physical AI RAG Chatbot")
+
+# FIXED: Dynamic path to find 'templates' folder from the 'api' directory
+current_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.dirname(current_dir)
+templates = Jinja2Templates(directory=os.path.join(root_dir, "templates"))
+
 # --- Configuration ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHAT_MODEL = "llama-3.3-70b-versatile" 
-
-if not GROQ_API_KEY:
-    raise ValueError("Error: GROQ_API_KEY is missing from .env file.")
 
 # --- Initialize AI Clients ---
 print("Initializing AI clients...")
 try:
     qdrant_client = get_qdrant_client()
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    
-    chat_llm = ChatGroq(
-        groq_api_key=GROQ_API_KEY, 
-        model_name=CHAT_MODEL, 
-        temperature=0
-    )
-    print("AI clients initialized successfully.")
+    chat_llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name=CHAT_MODEL, temperature=0)
 except Exception as e:
-    print(f"Error initializing clients: {e}")
-    raise e
-
-# --- FastAPI Setup ---
-app = FastAPI(title="Physical AI RAG Chatbot")
-templates = Jinja2Templates(directory="templates")
+    print(f"Init Error: {e}")
 
 class QueryRequest(BaseModel):
     question: str
@@ -163,88 +157,54 @@ async def read_root(request: Request):
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
-    """Handles PDF upload, splits text, and stores vectors in Qdrant."""
-    temp_path = f"temp_{file.filename}"
+    temp_path = f"/tmp/{file.filename}" # Use /tmp/ for Vercel write access
     try:
-        # 1. Save file temporarily
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # 2. Load and Split PDF
         loader = PyPDFLoader(temp_path)
         docs = loader.load()
-        
-        # Split text into 1000-character chunks
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
         chunks = text_splitter.split_documents(docs)
 
-        # 3. Create Vectors and Upload to Qdrant
         points = []
         for i, chunk in enumerate(chunks):
             vector = embeddings.embed_query(chunk.page_content)
             points.append({
                 "id": os.urandom(16).hex(),
                 "vector": vector,
-                "payload": {
-                    "text": chunk.page_content, 
-                    "source": file.filename
-                }
+                "payload": {"text": chunk.page_content, "source": file.filename}
             })
         
-        # Batch upload to Qdrant
         qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
-        
-        return {"message": f"Successfully indexed {len(chunks)} sections from {file.filename}!"}
-
+        return {"message": f"Successfully indexed {len(chunks)} sections!"}
     except Exception as e:
-        print(f"Upload Error: {e}")
-        return {"message": f"Error processing PDF: {str(e)}"}
+        return {"message": f"Error: {str(e)}"}
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
 @app.post("/query", response_model=QueryResponse)
 async def query_knowledge_base(query: QueryRequest):
-    question_text = query.question.strip()
-    if not question_text:
-        raise HTTPException(status_code=400, detail="Empty query.")
-
     try:
-        # 1. Search Qdrant for relevant context
-        query_vector = embeddings.embed_query(question_text)
-        response = qdrant_client.query_points(
-            collection_name=COLLECTION_NAME,
-            query=query_vector,
-            limit=5 
-        )
+        query_vector = embeddings.embed_query(query.question)
+        response = qdrant_client.query_points(collection_name=COLLECTION_NAME, query=query_vector, limit=5)
         
         if not response.points:
-            return QueryResponse(answer="I couldn't find any relevant information.", sources=[])
+            return QueryResponse(answer="No relevant info found.", sources=[])
 
-        # 2. Build context
-        context_text = ""
-        sources_list = set()
-        for pt in response.points:
-            context_text += f"\n---\n{pt.payload['text']}\n"
-            sources_list.add(pt.payload.get('source', 'Unknown'))
+        context_text = "\n".join([pt.payload['text'] for pt in response.points])
+        sources = list(set([pt.payload.get('source', 'Unknown') for pt in response.points]))
 
-        # 3. Generate Answer
-        system_prompt = f"""You are a Physical AI expert. Answer the question strictly using the context. 
-        If the answer isn't there, say you don't know.
-        Context: {context_text}"""
-
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=question_text)
-        ]
-
-        ai_response = chat_llm.invoke(messages)
-        return QueryResponse(answer=ai_response.content, sources=list(sources_list))
-
+        system_prompt = f"Answer using context only: {context_text}"
+        messages = [SystemMessage(content=system_prompt), HumanMessage(content=query.question)]
+        ai_res = chat_llm.invoke(messages)
+        
+        return QueryResponse(answer=ai_res.content, sources=sources)
     except Exception as e:
-        print(f"Query Error: {e}")
-        return QueryResponse(answer="Internal server error.", sources=[])
+        return QueryResponse(answer=f"Error: {str(e)}", sources=[])
 
+# Local run (Vercel ignores this)
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=3000, reload=True)
+    uvicorn.run(app, host="127.0.0.1", port=3000)
