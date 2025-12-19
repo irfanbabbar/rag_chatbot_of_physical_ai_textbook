@@ -93,7 +93,7 @@
 # @app.get("/")
 # async def root():
 #     return {"message": "RAG Chatbot FastAPI is running!"}
-# backend/main.py
+# api/main.py
 import os
 import shutil
 import ssl
@@ -111,7 +111,6 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Import your custom Qdrant settings
 # Use the dot (.) for relative import
 from .vector_db import get_qdrant_client, COLLECTION_NAME
 
@@ -124,23 +123,36 @@ ssl._create_default_https_context = ssl._create_unverified_context
 # --- FastAPI Setup ---
 app = FastAPI(title="Physical AI RAG Chatbot")
 
-# FIXED: Dynamic path to find 'templates' folder from the 'api' directory
+# Path to find 'templates' folder
 current_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.dirname(current_dir)
 templates = Jinja2Templates(directory=os.path.join(root_dir, "templates"))
 
-# --- Configuration ---
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-CHAT_MODEL = "llama-3.3-70b-versatile" 
+# --- Global Client Variables (Lazy Init) ---
+_qdrant_client = None
+_embeddings = None
+_chat_llm = None
 
-# --- Initialize AI Clients ---
-print("Initializing AI clients...")
-try:
-    qdrant_client = get_qdrant_client()
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    chat_llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name=CHAT_MODEL, temperature=0)
-except Exception as e:
-    print(f"Init Error: {e}")
+def get_clients():
+    """Lazy initialization of AI clients to avoid Vercel boot timeouts."""
+    global _qdrant_client, _embeddings, _chat_llm
+    
+    if _qdrant_client is None:
+        _qdrant_client = get_qdrant_client()
+    
+    if _embeddings is None:
+        # Note: This is a heavy model (100MB+). It will load on first request.
+        _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    
+    if _chat_llm is None:
+        GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+        _chat_llm = ChatGroq(
+            groq_api_key=GROQ_API_KEY, 
+            model_name="llama-3.3-70b-versatile", 
+            temperature=0
+        )
+        
+    return _qdrant_client, _embeddings, _chat_llm
 
 class QueryRequest(BaseModel):
     question: str
@@ -157,8 +169,10 @@ async def read_root(request: Request):
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
-    temp_path = f"/tmp/{file.filename}" # Use /tmp/ for Vercel write access
+    temp_path = f"/tmp/{file.filename}"
     try:
+        q_client, embs, _ = get_clients() # Use lazy loader
+        
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
@@ -169,14 +183,14 @@ async def upload_pdf(file: UploadFile = File(...)):
 
         points = []
         for i, chunk in enumerate(chunks):
-            vector = embeddings.embed_query(chunk.page_content)
+            vector = embs.embed_query(chunk.page_content)
             points.append({
                 "id": os.urandom(16).hex(),
                 "vector": vector,
                 "payload": {"text": chunk.page_content, "source": file.filename}
             })
         
-        qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
+        q_client.upsert(collection_name=COLLECTION_NAME, points=points)
         return {"message": f"Successfully indexed {len(chunks)} sections!"}
     except Exception as e:
         return {"message": f"Error: {str(e)}"}
@@ -187,8 +201,10 @@ async def upload_pdf(file: UploadFile = File(...)):
 @app.post("/query", response_model=QueryResponse)
 async def query_knowledge_base(query: QueryRequest):
     try:
-        query_vector = embeddings.embed_query(query.question)
-        response = qdrant_client.query_points(collection_name=COLLECTION_NAME, query=query_vector, limit=5)
+        q_client, embs, llm = get_clients() # Use lazy loader
+        
+        query_vector = embs.embed_query(query.question)
+        response = q_client.query_points(collection_name=COLLECTION_NAME, query=query_vector, limit=5)
         
         if not response.points:
             return QueryResponse(answer="No relevant info found.", sources=[])
@@ -198,13 +214,12 @@ async def query_knowledge_base(query: QueryRequest):
 
         system_prompt = f"Answer using context only: {context_text}"
         messages = [SystemMessage(content=system_prompt), HumanMessage(content=query.question)]
-        ai_res = chat_llm.invoke(messages)
+        ai_res = llm.invoke(messages)
         
         return QueryResponse(answer=ai_res.content, sources=sources)
     except Exception as e:
         return QueryResponse(answer=f"Error: {str(e)}", sources=[])
 
-# Local run (Vercel ignores this)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=3000)
