@@ -1,19 +1,5 @@
-# Node.js/JavaScript/TypeScript
-node_modules/
-dist/
-build/
-*.log
-.env*
-
-# Universal
-.DS_Store
-Thumbs.db
-*.tmp
-*.swp
+venv311/
+__pycache__/
+*.pdf
+.env
 .vscode/
-.idea/
-
-# Docusaurus specific (common ignores)
-.docusaurus/
-build/
-.cache/
