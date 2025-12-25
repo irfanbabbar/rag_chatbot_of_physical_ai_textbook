@@ -93,14 +93,14 @@
 # @app.get("/")
 # async def root():
 #     return {"message": "RAG Chatbot FastAPI is running!"}
+
 # api/main.py
 import os
 import shutil
 import ssl
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List
 
@@ -111,8 +111,11 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Use the dot (.) for relative import
-from .vector_db import get_qdrant_client, COLLECTION_NAME
+# FIXED: Import vector_db directly (not relative import)
+try:
+    from api.vector_db import get_qdrant_client, COLLECTION_NAME
+except ImportError:
+    from vector_db import get_qdrant_client, COLLECTION_NAME
 
 # Load environment variables
 load_dotenv()
@@ -121,12 +124,21 @@ load_dotenv()
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # --- FastAPI Setup ---
-app = FastAPI(title="Physical AI RAG Chatbot")
+app = FastAPI(
+    title="Physical AI RAG Chatbot",
+    description="RAG-based chatbot for Physical AI Textbook",
+    version="1.0.0"
+)
 
-# Path to find 'templates' folder
-current_dir = os.path.dirname(os.path.abspath(__file__))
-root_dir = os.path.dirname(current_dir)
-templates = Jinja2Templates(directory=os.path.join(root_dir, "templates"))
+# Add CORS for frontend access
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- Global Client Variables (Lazy Init) ---
 _qdrant_client = None
@@ -146,6 +158,8 @@ def get_clients():
     
     if _chat_llm is None:
         GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+        if not GROQ_API_KEY:
+            raise ValueError("GROQ_API_KEY not found in environment variables")
         _chat_llm = ChatGroq(
             groq_api_key=GROQ_API_KEY, 
             model_name="llama-3.3-70b-versatile", 
@@ -163,22 +177,45 @@ class QueryResponse(BaseModel):
 
 # --- Routes ---
 
-@app.get("/", response_class=HTMLResponse)
-async def read_root(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+@app.get("/")
+async def root():
+    """Root endpoint with API info"""
+    return {
+        "status": "success",
+        "message": "Physical AI Textbook RAG Chatbot API",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "/health",
+            "upload": "/upload-pdf (POST)",
+            "query": "/query (POST)",
+            "docs": "/docs"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "RAG Chatbot API"
+    }
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
+    """Upload and index a PDF document"""
     temp_path = f"/tmp/{file.filename}"
     try:
-        q_client, embs, _ = get_clients() # Use lazy loader
+        q_client, embs, _ = get_clients()
         
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
         loader = PyPDFLoader(temp_path)
         docs = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, 
+            chunk_overlap=100
+        )
         chunks = text_splitter.split_documents(docs)
 
         points = []
@@ -187,39 +224,69 @@ async def upload_pdf(file: UploadFile = File(...)):
             points.append({
                 "id": os.urandom(16).hex(),
                 "vector": vector,
-                "payload": {"text": chunk.page_content, "source": file.filename}
+                "payload": {
+                    "text": chunk.page_content, 
+                    "source": file.filename
+                }
             })
         
         q_client.upsert(collection_name=COLLECTION_NAME, points=points)
-        return {"message": f"Successfully indexed {len(chunks)} sections!"}
+        return {
+            "status": "success",
+            "message": f"Successfully indexed {len(chunks)} sections from {file.filename}"
+        }
     except Exception as e:
-        return {"message": f"Error: {str(e)}"}
+        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
 @app.post("/query", response_model=QueryResponse)
 async def query_knowledge_base(query: QueryRequest):
+    """Query the knowledge base with a question"""
     try:
-        q_client, embs, llm = get_clients() # Use lazy loader
+        q_client, embs, llm = get_clients()
         
         query_vector = embs.embed_query(query.question)
-        response = q_client.query_points(collection_name=COLLECTION_NAME, query=query_vector, limit=5)
+        response = q_client.query_points(
+            collection_name=COLLECTION_NAME, 
+            query=query_vector, 
+            limit=5
+        )
         
         if not response.points:
-            return QueryResponse(answer="No relevant info found.", sources=[])
+            return QueryResponse(
+                answer="No relevant information found in the knowledge base.",
+                sources=[]
+            )
 
-        context_text = "\n".join([pt.payload['text'] for pt in response.points])
-        sources = list(set([pt.payload.get('source', 'Unknown') for pt in response.points]))
+        context_text = "\n\n".join([
+            pt.payload['text'] for pt in response.points
+        ])
+        sources = list(set([
+            pt.payload.get('source', 'Unknown') 
+            for pt in response.points
+        ]))
 
-        system_prompt = f"Answer using context only: {context_text}"
-        messages = [SystemMessage(content=system_prompt), HumanMessage(content=query.question)]
+        system_prompt = (
+            "You are a helpful AI assistant. Answer the user's question "
+            "based only on the following context. If the answer is not in "
+            "the context, say so.\n\nContext:\n" + context_text
+        )
+        messages = [
+            SystemMessage(content=system_prompt), 
+            HumanMessage(content=query.question)
+        ]
         ai_res = llm.invoke(messages)
         
-        return QueryResponse(answer=ai_res.content, sources=sources)
+        return QueryResponse(
+            answer=ai_res.content, 
+            sources=sources
+        )
     except Exception as e:
-        return QueryResponse(answer=f"Error: {str(e)}", sources=[])
+        raise HTTPException(status_code=500, detail=f"Error querying: {str(e)}")
 
+# For local development
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=3000)

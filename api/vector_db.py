@@ -37,7 +37,6 @@ from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 
 # Load environment variables from the .env file
-# We need to look up one directory because .env is in the root folder
 load_dotenv()
 
 # --- Configuration ---
@@ -52,17 +51,22 @@ def get_qdrant_client() -> QdrantClient:
     # Basic error checking to ensure keys are loaded
     if not QDRANT_URL or not QDRANT_API_KEY:
         raise ValueError(
-            "Error: QDRANT_URL or QDRANT_API_KEY is not set in the .env file. "
-            "Please check your configuration."
+            "Error: QDRANT_URL or QDRANT_API_KEY is not set in environment variables. "
+            "Please configure them in Vercel dashboard or .env file."
         )
 
     # Create the connection to Qdrant Cloud
-    client = QdrantClient(
-        url=QDRANT_URL,
-        api_key=QDRANT_API_KEY,
-    )
-    print(f"Successfully connected to Qdrant at: {QDRANT_URL}")
-    return client
+    try:
+        client = QdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY,
+        )
+        # Only print in local development
+        if os.getenv("VERCEL_ENV") is None:
+            print(f"Successfully connected to Qdrant at: {QDRANT_URL}")
+        return client
+    except Exception as e:
+        raise ConnectionError(f"Failed to connect to Qdrant: {str(e)}")
 
 # Small test to ensure it works when run directly
 if __name__ == "__main__":
